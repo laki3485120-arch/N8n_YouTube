@@ -1,0 +1,72 @@
+# Save this file in your repo as:  .github/workflows/render.yml
+# No YouTube secrets needed - the video is published as a GitHub Release asset
+# and n8n (with your existing YouTube connection) downloads + uploads it.
+name: Render Hindi Short
+
+on:
+  # n8n calls: POST /repos/OWNER/REPO/dispatches  {"event_type":"render-short","client_payload":{...}}
+  repository_dispatch:
+    types: [render-short]
+  # Manual test run from the Actions tab (paste a payload JSON)
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'Payload JSON: {"tag":"short-test1","scenes":[...],"title":"...","hashtags":["#a"]}'
+        required: true
+
+permissions:
+  contents: write   # needed to create the Release
+
+concurrency:
+  group: render-short
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg, Hindi font, edge-tts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core
+          pip install --upgrade edge-tts
+
+      - name: Write payload to file
+        env:
+          PAYLOAD: ${{ github.event_name == 'repository_dispatch' && toJson(github.event.client_payload) || github.event.inputs.payload }}
+        run: printf '%s' "$PAYLOAD" > payload.json
+
+      - name: Render video and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Optional - only if Pollinations rate-limits GitHub's shared IPs:
+          # POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+        run: python make_video.py payload.json
+
+      - name: Keep only the latest 7 releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName \
+            --jq '[.[] | select(.tagName | startswith("short-"))][7:][].tagName' \
+          | while read -r t; do gh release delete "$t" --cleanup-tag --yes || true; done
+
+      - name: Backup copy of the video (3 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-video
+          path: final_short.mp4
+          retention-days: 3
+          if-no-files-found: ignore
