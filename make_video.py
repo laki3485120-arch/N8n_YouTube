@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_video.py - Hindi Shorts generator (GitHub Actions) - 1080x1920 Full HD, 30 FPS
+make_video.py - Hindi Shorts generator for GitHub Actions
+1080x1920 (9:16) Full HD, 30 FPS, smooth Ken-Burns camera motion, karaoke subtitles.
 
 Usage : python make_video.py payload.json [--no-release]
 Input : payload.json = {"tag":"short-2026...","scenes":[...],"title":"...", ...}
-Output: /tmp/shorts_render/final_short.mp4  (also copied to ./final_short.mp4)
-        then published as a GitHub Release asset under <tag> (n8n downloads it from there).
+Output: /tmp/shorts_render/final_short.mp4 (+ copy at ./final_short.mp4),
+        published as a GitHub Release asset under <tag> (n8n downloads it from there).
 
-Pipeline per scene:
-  Pollinations flux image (1080x1920)  ->  edge-tts Madhur voice  ->
-  FFmpeg zoompan camera move (exact frames = audio length) + karaoke subtitles
-Then all scenes are joined (video stream copied, no second quality loss).
+Per scene : Pollinations flux image -> edge-tts Madhur voice -> FFmpeg zoompan + karaoke ASS
+Join      : video clips stream-copied; audio rebuilt sample-exact (no drift) and encoded once.
 
-Env (optional): POLLINATIONS_API_KEY  (only if anonymous Pollinations gets rate-limited)
+Optional env: POLLINATIONS_API_KEY (only if anonymous Pollinations gets rate-limited)
 """
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -34,16 +34,20 @@ W, H = 1080, 1920
 FPS = 30
 CRF = "18"
 PRESET = "fast"
+AUDIO_RATE = 44100                 # 44100 / 30 fps = 1470 samples per frame (exact)
 OUT_DIR = "/tmp/shorts_render"
 WORK = os.path.join(OUT_DIR, "work")
 OUT = os.path.join(OUT_DIR, "final_short.mp4")
+
 FONT = "Noto Sans Devanagari"
 FONT_SIZE = 112
-WORDS_PER_CHUNK = 3
-PAD = 0.25                 # silence after each spoken line (seconds)
-SUPERSAMPLE = 2            # zoompan works on a 2x image => no jitter / shaky pixels
-PAN_ZOOM = 1.25            # constant zoom used while panning (gives room to move)
-IMG_BUDGET = 170           # max seconds spent per scene on image download retries
+MAX_WORDS_PER_CAPTION = 4
+MAX_CHARS_PER_CAPTION = 18         # keeps every caption to max 2 big lines
+PAD = 0.25                         # silence after each spoken line (seconds)
+SUPERSAMPLE = 3                    # zoompan works on a 3x image => sub-pixel smooth motion
+PAN_ZOOM = 1.25                    # constant zoom while panning (room to move)
+IMG_BUDGET_SCENE = 110             # max seconds of image retries per scene
+IMG_BUDGET_TOTAL = 12 * 60         # max seconds of image retries for the whole video
 
 STYLE = ("3D Pixar style cartoon character, 8k cinematic lighting, ultra detailed, "
          "sharp focus, vibrant colors, depth of field, vertical 9:16 composition")
@@ -53,6 +57,7 @@ EMOJI_RE = re.compile(
     "\U00002190-\U000021FF\U00002300-\U000023FF\U0000FE0F]+",
     flags=re.UNICODE,
 )
+T0 = time.time()
 
 
 def log(*a):
@@ -85,21 +90,23 @@ def clean_text(t):
 
 
 # ----------------------------- IMAGE ----------------------------------------
-def valid_image(path):
+def image_size(path):
     try:
-        run(["ffprobe", "-v", "error", "-show_entries", "stream=width", "-of", "csv=p=0", path])
-        return os.path.getsize(path) > 5000
+        out = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=width,height", "-of", "csv=p=0", path]).strip()
+        w, h = out.split(",")[:2]
+        return int(w), int(h)
     except Exception:
-        return False
+        return None
 
 
 def fetch_image(prompt, path, seed):
-    """Pollinations flux image, 1080x1920. Falls back to 720x1280 (upscaled later) if needed."""
+    """Pollinations flux 1080x1920. Last retries use 720x1280 (upscaled later) if HD keeps failing."""
     q = urllib.parse.quote(prompt[:900])
     key = os.environ.get("POLLINATIONS_API_KEY", "").strip()
-    deadline = time.time() + IMG_BUDGET
+    deadline = min(time.time() + IMG_BUDGET_SCENE, T0 + IMG_BUDGET_TOTAL)
     attempt = 0
-    while time.time() < deadline:
+    while True:
         attempt += 1
         w, h = (W, H) if attempt <= 3 else (720, 1280)
         urls = [
@@ -107,8 +114,6 @@ def fetch_image(prompt, path, seed):
             "https://gen.pollinations.ai/image/%s?width=%d&height=%d&model=flux&seed=%d&nologo=true" % (q, w, h, seed),
         ]
         for u in urls:
-            if time.time() > deadline:
-                break
             try:
                 headers = {"User-Agent": "Mozilla/5.0"}
                 if key and "gen.pollinations.ai" in u:
@@ -120,12 +125,15 @@ def fetch_image(prompt, path, seed):
                 if "image" in ctype and len(data) > 5000:
                     with open(path, "wb") as f:
                         f.write(data)
-                    if valid_image(path):
+                    size = image_size(path)
+                    if size:
+                        log("  image ok %dx%d (requested %dx%d)" % (size[0], size[1], w, h))
                         return True
             except Exception as e:
                 log("  image attempt %d (%dx%d) failed: %s" % (attempt, w, h, e))
+        if time.time() >= deadline:
+            return False
         time.sleep(min(8 * attempt, max(0, deadline - time.time())))
-    return False
 
 
 def fallback_image(path):
@@ -169,7 +177,7 @@ def build_word_timings(text, events, total):
             words.append([p, cur, d])
             cur += d
     clean_words = text.split()
-    if len(words) < max(1, len(clean_words) // 2):
+    if len(words) < max(1, len(clean_words) // 2):      # no usable boundaries -> estimate
         tot = sum(len(w) for w in clean_words) or 1
         span = max(total - 0.15, 0.5)
         cur = 0.0
@@ -190,10 +198,25 @@ def ass_time(t):
     return "%d:%02d:%02d.%02d" % (h, m, s, c)
 
 
+def split_captions(words):
+    """Group words so each caption has <= MAX_WORDS words and <= MAX_CHARS characters."""
+    caps, cur, chars = [], [], 0
+    for w in words:
+        add = len(w[0]) + (1 if cur else 0)
+        if cur and (len(cur) >= MAX_WORDS_PER_CAPTION or chars + add > MAX_CHARS_PER_CAPTION):
+            caps.append(cur)
+            cur, chars, add = [], 0, len(w[0])
+        cur.append(w)
+        chars += add
+    if cur:
+        caps.append(cur)
+    return caps
+
+
 def ass_events(words, scene_len):
     """Karaoke lines for ONE scene (times start at 0 for that scene)."""
     lines = []
-    chunks = [words[i:i + WORDS_PER_CHUNK] for i in range(0, len(words), WORDS_PER_CHUNK)]
+    chunks = split_captions(words)
     for ci, ch in enumerate(chunks):
         start = ch[0][1]
         if ci + 1 < len(chunks):
@@ -205,7 +228,7 @@ def ass_events(words, scene_len):
         for wi, (w, ws, _wd) in enumerate(ch):
             nxt = ch[wi + 1][1] if wi + 1 < len(ch) else end
             cs = max(1, int(round((nxt - ws) * 100)))
-            parts.append("{\\kf%d}%s" % (cs, w))
+            parts.append("{\\kf%d}%s" % (cs, w))       # \kf = smooth fill: white -> yellow
         lines.append("Dialogue: 0,%s,%s,Karaoke,,0,0,0,,%s" % (
             ass_time(start), ass_time(end), " ".join(parts)))
     return lines
@@ -219,7 +242,7 @@ def write_ass(path, event_lines):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        # Primary = yellow (spoken), Secondary = white (upcoming), black outline
+        # Primary = YELLOW (already spoken), Secondary = WHITE (coming up), thick black outline
         "Style: Karaoke,%s,%d,&H0000E6FF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,"
         "100,100,0,0,1,8,3,5,60,60,0,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -230,40 +253,53 @@ def write_ass(path, event_lines):
 
 # ----------------------------- CAMERA MOTION --------------------------------
 def camera_expr(motion, n):
-    """Return (z, x, y) zoompan expressions. Smoothstep easing => no sudden start/stop."""
-    e = "(pow(on/%d,2)*(3-2*on/%d))" % (n, n)         # 0 -> 1 eased
+    """(z, x, y) zoompan expressions. Eased (soft start/stop) but never fully static."""
+    t = "(on/%d)" % max(n - 1, 1)
+    e = "(0.4*%s+0.6*pow(%s,2)*(3-2*%s))" % (t, t, t)   # 0 -> 1
     cx = "iw/2-(iw/zoom/2)"
     cy = "ih/2-(ih/zoom/2)"
     pz = "%.2f" % PAN_ZOOM
     moves = [
-        # 0: smooth zoom-in (center)
-        ("1.0+0.22*%s" % e, cx, cy),
-        # 1: pan left -> right
-        (pz, "(iw-iw/zoom)*%s" % e, cy),
-        # 2: smooth zoom-out
-        ("1.22-0.22*%s" % e, cx, cy),
-        # 3: pan bottom -> top
-        (pz, cx, "(ih-ih/zoom)*(1-%s)" % e),
-        # 4: pan right -> left
-        (pz, "(iw-iw/zoom)*(1-%s)" % e, cy),
-        # 5: zoom-in drifting toward the upper part (face area)
-        ("1.0+0.22*%s" % e, cx, "(ih-ih/zoom)*0.35"),
+        ("1.0+0.22*%s" % e, cx, cy),                      # 0: zoom-in
+        (pz, "(iw-iw/zoom)*%s" % e, cy),                  # 1: pan left -> right
+        ("1.22-0.22*%s" % e, cx, cy),                     # 2: zoom-out
+        (pz, cx, "(ih-ih/zoom)*(1-%s)" % e),              # 3: pan bottom -> top
+        (pz, "(iw-iw/zoom)*(1-%s)" % e, cy),              # 4: pan right -> left
+        ("1.0+0.22*%s" % e, cx, "(ih-ih/zoom)*0.35"),     # 5: zoom-in toward upper area
     ]
     return moves[motion % len(moves)]
 
 
-# ----------------------------- VIDEO ----------------------------------------
-def make_clip(motion, img, mp3, ass_path, dur, out):
-    n = max(1, int(round(dur * FPS)))                  # frames = exact audio length * FPS
+# ----------------------------- VIDEO / AUDIO --------------------------------
+def make_video_clip(motion, img, ass_path, n, out):
+    """Silent video clip with exactly n frames."""
     z, x, y = camera_expr(motion, n)
     sw, sh = W * SUPERSAMPLE, H * SUPERSAMPLE
     vf = ("scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d,"
           "zoompan=z='%s':x='%s':y='%s':d=%d:s=%dx%d:fps=%d,"
-          "ass=filename=%s,format=yuv420p") % (sw, sh, sw, sh, z, x, y, n, W, H, FPS, ass_path)
-    run(["ffmpeg", "-y", "-i", img, "-i", mp3, "-vf", vf,
-         "-af", "apad=pad_dur=%s" % PAD, "-frames:v", str(n), "-t", "%.3f" % (n / FPS),
-         "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p",
-         "-r", str(FPS), "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", out])
+          "ass=filename=%s,"
+          "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+          ) % (sw, sh, sw, sh, z, x, y, n, W, H, FPS, ass_path)
+    run(["ffmpeg", "-y", "-i", img, "-vf", vf, "-an", "-frames:v", str(n),
+         "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", str(FPS),
+         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+         "-color_range", "tv", out])
+
+
+def make_audio_wav(mp3, n, out):
+    """Voice padded/cut to EXACTLY n frames of time (n/FPS s) -> sample-exact A/V sync."""
+    d = n / FPS
+    run(["ffmpeg", "-y", "-i", mp3,
+         "-af", "aresample=%d,aformat=sample_fmts=s16:channel_layouts=stereo,"
+                "apad=whole_dur=%.6f,atrim=end=%.6f" % (AUDIO_RATE, d, d),
+         "-ar", str(AUDIO_RATE), "-ac", "2", "-c:a", "pcm_s16le", out])
+
+
+def concat(files, out, list_path):
+    with open(list_path, "w") as f:
+        for c in files:
+            f.write("file '%s'\n" % c)
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out])
 
 
 def render(scenes):
@@ -272,11 +308,12 @@ def render(scenes):
     if os.path.exists(OUT):
         os.remove(OUT)
 
-    if "devanagari" not in subprocess.run(["fc-list"], capture_output=True, text=True).stdout.lower():
-        log("WARNING: Devanagari font missing (apt install fonts-noto-core)")
+    fams = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True).stdout
+    if FONT.lower() not in fams.lower():
+        log("WARNING: font '%s' missing -> Hindi subtitles may look wrong (apt install fonts-noto-core)" % FONT)
 
-    seed = random.randint(1, 999999)       # same seed => more consistent character
-    clips, prev_img, motion = [], None, 0
+    seed = random.randint(1, 999999)       # same seed => more consistent character across scenes
+    vclips, aclips, prev_img, motion = [], [], None, 0
 
     for i, sc in enumerate(scenes):
         text = clean_text(sc.get("dialogue", ""))
@@ -286,7 +323,8 @@ def render(scenes):
         img = os.path.join(WORK, "img_%02d.jpg" % i)
         mp3 = os.path.join(WORK, "voice_%02d.mp3" % i)
         ass = os.path.join(WORK, "subs_%02d.ass" % i)
-        clip = os.path.join(WORK, "clip_%02d.mp4" % i)
+        vclip = os.path.join(WORK, "v_%02d.mp4" % i)
+        wav = os.path.join(WORK, "a_%02d.wav" % i)
 
         # 1) image
         prompt = "%s. Background: %s. %s" % (sc.get("image_prompt", ""), sc.get("background", ""), STYLE)
@@ -311,28 +349,30 @@ def render(scenes):
             raise RuntimeError("edge-tts failed for scene %d" % (i + 1))
         audio_len = media_duration(mp3)
 
-        # 3) subtitles + camera move, frames computed from exact audio length
-        dur = audio_len + PAD
+        # 3) frames from exact audio length, subtitles, camera move, sample-exact audio
+        n = int(math.ceil((audio_len + PAD) * FPS))
         words = build_word_timings(text, events, audio_len)
-        write_ass(ass, ass_events(words, dur))
-        make_clip(motion, img, mp3, ass, dur, clip)
-        clips.append(clip)
+        write_ass(ass, ass_events(words, n / FPS))
+        make_video_clip(motion, img, ass, n, vclip)
+        make_audio_wav(mp3, n, wav)
+        vclips.append(vclip)
+        aclips.append(wav)
         motion += 1
         time.sleep(2)
 
-    if not clips:
+    if not vclips:
         raise RuntimeError("No clips were generated")
 
-    # 4) join all scenes: video copied as-is (no re-encode), audio re-encoded once (clean joins)
-    concat_txt = os.path.join(WORK, "concat.txt")
-    with open(concat_txt, "w") as f:
-        for c in clips:
-            f.write("file '%s'\n" % c)
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+    # 4) join: video stream-copied, audio concatenated losslessly then encoded ONCE
+    video_all = os.path.join(WORK, "video_all.mp4")
+    audio_all = os.path.join(WORK, "audio_all.wav")
+    concat(vclips, video_all, os.path.join(WORK, "v.txt"))
+    concat(aclips, audio_all, os.path.join(WORK, "a.txt"))
+    run(["ffmpeg", "-y", "-i", video_all, "-i", audio_all, "-map", "0:v:0", "-map", "1:a:0",
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", OUT])
 
     total = media_duration(OUT)
-    log("Rendered %s (%.1fs, %d scenes, %dx%d @ %dfps)" % (OUT, total, len(clips), W, H, FPS))
+    log("Rendered %s (%.1fs, %d scenes, %dx%d @ %dfps)" % (OUT, total, len(vclips), W, H, FPS))
     if total > 59:
         log("WARNING: video is %.1fs, longer than a 60s Short" % total)
     shutil.rmtree(WORK, ignore_errors=True)
@@ -350,7 +390,11 @@ def publish_release(path, tag, title):
         tag = "short-run-%s" % os.environ.get("GITHUB_RUN_ID", int(time.time()))
         log("Invalid/missing tag in payload, using %s" % tag)
     notes = (title or "Hindi Short").strip()[:200]
-    run(["gh", "release", "create", tag, path, "--title", tag, "--notes", notes])
+    try:
+        run(["gh", "release", "create", tag, path, "--title", tag, "--notes", notes])
+    except RuntimeError as e:                    # e.g. re-run of the same tag
+        log("release create failed (%s) -> trying upload --clobber" % str(e)[:200])
+        run(["gh", "release", "upload", tag, path, "--clobber"])
     log("Release published: %s" % tag)
     return tag
 
